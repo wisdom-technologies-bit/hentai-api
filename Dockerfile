@@ -1,44 +1,41 @@
-# Use the official Bun image as the base image for building
-FROM oven/bun:latest as builder
+# Bun runtime + Chromium, nothing else.
+#
+# The old image installed mongodb and redis-server from apt inside node:20; the
+# mongodb package no longer exists in Debian's repos, so that build could not
+# succeed, and both services belong outside the app container anyway.
 
-# Copy package.json and bun.lockb to the working directory
-COPY package.json ./
-COPY bun.lockb ./
-# Copy the source code
-COPY src ./
+FROM oven/bun:1 AS deps
+WORKDIR /app
+COPY package.json bun.lockb* ./
+RUN bun install --frozen-lockfile || bun install
 
-# Install dependencies
-RUN bun install
-
-# Use the official Node.js image as the base image for the final image
-FROM node:20
-
-# Set the working directory
+FROM oven/bun:1
 WORKDIR /app
 
-# Copy node_modules from the builder stage
-COPY --from=builder /app/node_modules ./node_modules
-# Copy package.json and bun.lockb from the builder stage
-COPY --from=builder /app/package.json ./package.json
-COPY --from=builder /app/bun.lockb ./bun.lockb
-# Copy the source code from the builder stage
-COPY --from=builder /app/src ./src
+# Chromium needs these shared libraries; bun's base image does not ship them.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      ca-certificates fonts-liberation libasound2 libatk-bridge2.0-0 libatk1.0-0 \
+      libatspi2.0-0 libcairo2 libcups2 libdbus-1-3 libdrm2 libgbm1 libglib2.0-0 \
+      libnspr4 libnss3 libpango-1.0-0 libx11-6 libxcb1 libxcomposite1 libxdamage1 \
+      libxext6 libxfixes3 libxkbcommon0 libxrandr2 libxshmfence1 wget \
+ && find /var/lib/apt/lists -type f -delete
 
-# Install mongodb
-RUN apt-get update && apt-get install -y mongodb
+COPY --from=deps /app/node_modules ./node_modules
+COPY package.json ./
+COPY src ./src
+COPY tests ./tests
 
-# Install redis-server
-RUN apt-get update && apt-get install -y redis-server
+# The browser resolver is the only way to read the sources, so ship it.
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+RUN bunx playwright install --with-deps chromium && chmod -R 755 /ms-playwright
 
-# Set environment variables
 ENV NODE_ENV=production
-ENV MONGODB_URL=mongodb://localhost:27017/hentai-api
-ENV REDIS_HOST=localhost
-# The Redis password is a required variable, but Redis server doesn't have a password enabled by default, so we're passing a dummy value.
-ENV REDIS_PASSWORD=password
-
-# Expose port 3000
+ENV PORT=3000
 EXPOSE 3000
 
-# Command to run the application
+# Runtime check: the app must answer /health.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+  CMD wget -qO- "http://127.0.0.1:${PORT}/health" >/dev/null || exit 1
+
 CMD ["bun", "run", "start"]

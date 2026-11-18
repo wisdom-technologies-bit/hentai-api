@@ -1,0 +1,31 @@
+# app + optional redis. Chromium runs inside the app container, so there is no
+# separate solver service to add: the resolver drives the browser itself.
+services:
+  api:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      # Cache is optional; without REDIS_HOST the app keeps it in memory.
+      REDIS_HOST: redis
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      # Required in practice: Cloudflare challenges a datacenter IP, so the
+      # resolver needs a residential or mobile egress.
+      SOURCE_PROXY_URL: ${SOURCE_PROXY_URL:-}
+      UNBLOCKER_URL: ${UNBLOCKER_URL:-}
+      R34_API_KEY: ${R34_API_KEY:-}
+      MONGODB_URL: ${MONGODB_URL:-}
+      BROWSER_TIMEOUT_MS: ${BROWSER_TIMEOUT_MS:-45000}
+    depends_on:
+      - redis
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:-}"]
+    volumes:
+      - redis-data:/data
+
+volumes:
+  redis-data:

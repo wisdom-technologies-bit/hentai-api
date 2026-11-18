@@ -14,19 +14,50 @@ import { SearchResultSchema, VideoSchema } from "./schema/hanime";
 import { InfoSchema, SearchAutocompleteSchema } from "./schema/r34";
 import { HentaiInfoSchema, HentaiSearchResultSchema, HentaiSourceSchema } from "./schema/hentai-haven";
 
-const missingEnvVars = [];
-if(!process.env.REDIS_HOST) missingEnvVars.push("REDIS_HOST");
-if(!process.env.REDIS_PASSWORD) missingEnvVars.push("REDIS_PASSWORD");
+/**
+ * Redis is a cache and a rate-limit counter, not a hard dependency: a deployment
+ * without it still resolves, it just recomputes and forgets. Requiring it (the
+ * old behaviour, which exited) is what made this service impossible to run as a
+ * single container.
+ */
+const redis = process.env.REDIS_HOST
+  ? new Redis({
+      host: process.env.REDIS_HOST,
+      password: process.env.REDIS_PASSWORD,
+      lazyConnect: true,
+      maxRetriesPerRequest: 2,
+    })
+  : undefined;
 
-if(missingEnvVars.length > 0) {
-  console.error(`Missing environment variables: ${missingEnvVars.join(', ')}`);
-  process.exit(1);
-}
+const memoryStore = new Map<string, { value: string; expiresAt: number }>();
 
-const redis = new Redis({
-    host: process.env.REDIS_HOST,
-    password: process.env.REDIS_PASSWORD
-});
+const kvGet = async (key: string): Promise<string | null> => {
+  if (redis) return redis.get(key);
+  const row = memoryStore.get(key);
+  if (!row) return null;
+  if (row.expiresAt <= Date.now()) { memoryStore.delete(key); return null; }
+  return row.value;
+};
+const kvSetEx = async (key: string, value: string, ttlSeconds: number): Promise<void> => {
+  if (redis) { await redis.set(key, value, 'EX', ttlSeconds); return; }
+  memoryStore.set(key, { value, expiresAt: Date.now() + ttlSeconds * 1000 });
+};
+const kvDel = async (key: string): Promise<void> => {
+  if (redis) { await kvDel(key); return; }
+  memoryStore.delete(key);
+};
+const kvIncr = async (key: string): Promise<number> => {
+  if (redis) return redis.incr(key);
+  const row = memoryStore.get(key);
+  const next = (row && row.expiresAt > Date.now() ? Number(row.value) : 0) + 1;
+  memoryStore.set(key, { value: String(next), expiresAt: row && row.expiresAt > Date.now() ? row.expiresAt : Date.now() + 60_000 });
+  return next;
+};
+const kvExpire = async (key: string, ttlSeconds: number): Promise<void> => {
+  if (redis) { await redis.expire(key, ttlSeconds); return; }
+  const row = memoryStore.get(key);
+  if (row) row.expiresAt = Date.now() + ttlSeconds * 1000;
+};
 const mongoClient = process.env.MONGODB_URL ? new MongoClient(process.env.MONGODB_URL) : undefined;
 let db: Db | undefined;
 let apiKeyCollection: Collection | undefined;
@@ -50,29 +81,29 @@ app.get("/", (c) => {
 });
 
 const rateLimit = async (c: Context, key: string, limit: number, ttl: number): Promise<Response | void> => {
-  const count = await redis.incr(key);
+  const count = await kvIncr(key);
   if (count > limit) {
     return c.json({ error: "Rate limit exceeded" }, 429);
   }
-  await redis.expire(key, ttl);
+  await kvExpire(key, ttl);
 };
 
 const cache = async <T extends object>(c: Context, key: string, fetcher: () => Promise<T>): Promise<Response> => {
-  const cached = await redis.get(key);
+  const cached = await kvGet(key);
   if (cached) {
     try {
       const data = JSON.parse(cached) as T;
       if (data === null || data === undefined || Object.keys(data).length === 0 || (Array.isArray(data) && data.length === 0) || (typeof data === 'string' && (data as string).trim() === '')) {
-        await redis.del(key);
+        await kvDel(key);
         const freshData = await fetcher();
-        await redis.set(key, JSON.stringify(freshData), 'EX', 3600);
+        await kvSetEx(key, JSON.stringify(freshData), 3600);
         return c.json(freshData);
       }
       return c.json(data);
     } catch (error) {
-      await redis.del(key);
+      await kvDel(key);
       const freshData = await fetcher();
-      await redis.set(key, JSON.stringify(freshData), 'EX', 3600);
+      await kvSetEx(key, JSON.stringify(freshData), 3600);
       return c.json(freshData);
     }
   }
@@ -80,7 +111,7 @@ const cache = async <T extends object>(c: Context, key: string, fetcher: () => P
   if (data === null || data === undefined || Object.keys(data).length === 0 || (Array.isArray(data) && data.length === 0) || (typeof data === 'string' && (data as string).trim() === '')) {
     return c.json(data);
   }
-  await redis.set(key, JSON.stringify(data), 'EX', 3600);
+  await kvSetEx(key, JSON.stringify(data), 3600);
   return c.json(data);
 };
 
@@ -140,17 +171,23 @@ app.get("/api/hh/sources/:id", async (c) => {
 });
 
 app.get("/api/r34/autocomplete/:query", async (c) => {
+  const keyCheck = requireRule34Key(c);
+  if (keyCheck) return keyCheck;
   const query = querySchema.parse(c.req.param("query"));
   console.log(query)
   return await handleRequest(c, Rule34, "fetchSearchAutocomplete", SearchAutocompleteSchema, query);
 });
 
 app.get("/api/r34/search/:query", async (c) => {
+  const keyCheck = requireRule34Key(c);
+  if (keyCheck) return keyCheck;
   const query = querySchema.parse(c.req.param("query"));
   return await handleRequest(c, Rule34, "fetchSearchResult", SearchResultSchema, query);
 });
 
 app.get("/api/r34/:id", async (c) => {
+  const keyCheck = requireRule34Key(c);
+  if (keyCheck) return keyCheck;
   const id = idSchema.parse(c.req.param("id"));
   return await handleRequest(c, Rule34, "fetchInfo", InfoSchema, id);
 });
@@ -169,6 +206,61 @@ app.get("/api/hanime/:id", async (c) => {
 app.get("/api/hanime/streams/:id", async (c) => {
     const id = idSchema.parse(c.req.param("id"));
     return await handleRequest(c, Hanime, "getEpisode", z.any(), id);
+});
+
+/**
+ * Liveness and configuration, without touching an upstream. Every degraded
+ * capability is named, so a deploy can be checked with one curl.
+ */
+app.get("/health", (c) => c.json({
+  ok: true,
+  cache: redis ? "redis" : "memory",
+  apiKeys: apiKeyCollection ? "mongo" : "open",
+  proxy: Boolean(process.env.SOURCE_PROXY_URL),
+  unblocker: Boolean(process.env.UNBLOCKER_URL),
+  rule34Key: Boolean(process.env.R34_API_KEY),
+}));
+
+/**
+ * Rule34's API now answers `Missing authentication` to every dapi query, so the
+ * r34 routes only work with a key. Say so instead of returning an empty list.
+ */
+const requireRule34Key = (c: Context): Response | undefined => {
+  if (process.env.R34_API_KEY) return undefined;
+  return c.json({
+    error: "RULE34_API_KEY_REQUIRED",
+    message: "api.rule34.xxx now requires an api_key on every dapi request. Set R34_API_KEY.",
+  }, 502);
+};
+
+/**
+ * The resolver KumoriTV uses for an adult title.
+ *
+ * `hanime.tv` deleted the JSON endpoints this project was built on and now hides
+ * the stream behind a client-side player, so the browser is the only reliable
+ * reader. Title mode takes a slug or a title (slugified, which is how hanime
+ * names its videos) and returns the streams the player requested.
+ */
+app.get("/api/resolve", async (c) => {
+  const slug = (c.req.query("slug") || "").trim();
+  const title = (c.req.query("title") || "").trim();
+  const candidate = slug || (title ? title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") : "");
+  if (!candidate) return c.json({ error: "MISSING_QUERY", message: "Pass ?slug= or ?title=" }, 400);
+
+  try {
+    const { loadWithBrowser } = await import("./lib/browser");
+    const page = await loadWithBrowser(`https://hanime.tv/videos/hentai/${candidate}`, {
+      proxyUrl: process.env.SOURCE_PROXY_URL,
+      timeoutMs: Number(process.env.BROWSER_TIMEOUT_MS ?? 45_000),
+    });
+    if (page.streams.length === 0) {
+      return c.json({ error: "NO_STREAM_FOUND", slug: candidate, title: page.title }, 404);
+    }
+    return c.json({ provider: "hanime", slug: candidate, title: page.title, poster: page.poster, streams: page.streams });
+  } catch (error: any) {
+    const status = typeof error?.status === "number" ? error.status : 502;
+    return c.json({ error: error?.code ?? "RESOLVE_FAILED", message: String(error?.message ?? error).slice(0, 240) }, status);
+  }
 });
 
 const port = process.env.PORT || 3000;
